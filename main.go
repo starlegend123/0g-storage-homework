@@ -1,138 +1,213 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
-	"os/exec"
-	"regexp"
-	"strings"
+
+	zg_common "github.com/0gfoundation/0g-storage-client/common"
+	"github.com/0gfoundation/0g-storage-client/common/blockchain"
+	"github.com/0gfoundation/0g-storage-client/common/shard"
+	"github.com/0gfoundation/0g-storage-client/core"
+	"github.com/0gfoundation/0g-storage-client/indexer"
+	"github.com/0gfoundation/0g-storage-client/transfer"
+	"github.com/openweb3/web3go"
+	"github.com/sirupsen/logrus"
 )
 
-// 配置区域
+// --- 配置区域 ---
 const (
-	// Client 路径 (Windows 记得带 .exe)
-	ClientBinaryPath = "./0g-storage-client.exe"
-
-	// 0G Testnet RPC
-	JsonRpc = "https://evm-rpc.0g.ai"
-
-	// [关键修改] 使用 Indexer 地址，而不是 StorageNode
-	IndexerUrl = "https://indexer-storage-testnet.0g.ai"
-
-	// 你的私钥 (去掉 0x)
-	PrivateKey = ""
-
-	TestFileName = "test_4gb_data.bin"
-	FileSize     = 4 * 1024 * 1024 * 1024 // 4GB
-	FragmentSize = 400 * 1024 * 1024      // 400MB
+	EvmRpcUrl     = "https://evmrpc-testnet.0g.ai"
+	IndexerUrl    = "https://indexer-storage-testnet-turbo.0g.ai"
+	TestFileName  = "test_4gb_file.bin"
+	LargeFileSize = 4 * 1024 * 1024 * 1024 // 4GB
+	ChunkSize     = 400 * 1024 * 1024      // 400MB 每个分片
+	// 【作业考点】Fragment Size 设置 (Upload Task Size)
+	UploadTaskSize = 16 * 1024 * 1024 // 16MB Fragment Size
 )
 
-func main() {
-	// 1. 生成 4GB 测试文件
-	fmt.Println(">>> 步骤 1: 生成 4GB 测试文件...")
-	err := generateLargeFile(TestFileName, FileSize)
-	if err != nil {
-		fmt.Printf("生成文件失败: %v\n", err)
-		return
-	}
-	// 程序结束后删除测试文件(可选)
-	// defer os.Remove(TestFileName)
-	fmt.Printf("文件 %s 生成完毕，大小: %d bytes\n", TestFileName, FileSize)
-
-	// 2. 执行上传命令
-	fmt.Println("\n>>> 步骤 2: 使用 0g-storage-client 上传 (设置 fragment-size)...")
-	fmt.Println("正在连接 Indexer 寻找可用节点，请耐心等待...")
-
-	uploadArgs := []string{
-		"upload",
-		"--url", JsonRpc,
-		"--key", PrivateKey,
-		"--file", TestFileName,
-		"--fragment-size", fmt.Sprintf("%d", FragmentSize),
-		// [关键修改] 这里使用的是 --indexer 和 IndexerUrl
-		"--indexer", IndexerUrl,
-	}
-
-	output, err := runCommand(ClientBinaryPath, uploadArgs...)
-	if err != nil {
-		fmt.Printf("上传失败: %v\n", err)
-		return
-	}
-
-	// 3. 从输出中解析 Root Hash
-	rootHash := parseRootHash(output)
-	if rootHash == "" {
-		fmt.Println("错误: 无法从输出中获取 Root Hash，请检查上方日志")
-		return
-	}
-	fmt.Printf(">>> 上传成功! Root Hash: %s\n", rootHash)
-
-	// 4. 执行下载命令
-	fmt.Println("\n>>> 步骤 3: 下载文件进行验证...")
-	downloadArgs := []string{
-		"download",
-		"--root", rootHash,
-		"--url", JsonRpc,
-		"--indexer", IndexerUrl, // 下载也加上 indexer 更保险
-		"--output", "downloaded_" + TestFileName,
-	}
-
-	_, err = runCommand(ClientBinaryPath, downloadArgs...)
-	if err != nil {
-		fmt.Printf("下载失败: %v\n", err)
-		return
-	}
-	fmt.Printf(">>> 文件下载成功: downloaded_%s\n", TestFileName)
+// 封装一个简单的客户端，提供 Upload / Download 能力
+type StorageClient struct {
+	idx *indexer.Client
+	w3  *web3go.Client
 }
 
-// --- 下面是辅助函数，保持不变 ---
+func main() {
+	// 读取私钥
+	privateKeyHex := os.Getenv("ZGS_PRIVATE_KEY")
+	if privateKeyHex == "" {
+		log.Fatal("❌ 请先设置环境变量：ZGS_PRIVATE_KEY=0x...")
+	}
 
-func generateLargeFile(filename string, size int64) error {
-	f, err := os.Create(filename)
+	ctx := context.Background()
+	uploader, err := setupClient(privateKeyHex)
+	if err != nil {
+		log.Fatalf("❌ 客户端初始化失败: %v", err)
+	}
+
+	// 可选：先打印当前 Indexer 返回的节点分布，便于作业说明/排障
+	debugShardedNodes(ctx)
+
+	fmt.Println("✅ 0G Storage Client 初始化成功")
+
+	// --- 步骤 1: 生成 4GB 稀疏文件 ---
+	fmt.Println("\n>>> 步骤 1: 生成 4GB 测试文件...")
+	if err := createDummyFile(TestFileName, LargeFileSize); err != nil {
+		log.Fatal(err)
+	}
+	defer os.Remove(TestFileName)
+	fmt.Printf("✅ %s 文件生成完毕\n", TestFileName)
+
+	// 打开文件准备切片上传
+	file, err := os.Open(TestFileName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	buffer := make([]byte, ChunkSize)
+	var roots []string
+
+	// --- 步骤 2: 循环切分并上传 10 个 400MB 分片 ---
+	fmt.Println("\n>>> 步骤 2: 开始上传 10 个 400MB 分片...")
+	for i := 0; i < 10; i++ {
+		fmt.Printf("\n--- 正在上传第 %d/10 个分片 ---\n", i+1)
+
+		n, err := io.ReadFull(file, buffer)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			log.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+
+		// Upload 返回 (txHash string, root string, error)
+		txHash, root, err := uploader.Upload(ctx, buffer[:n])
+		if err != nil {
+			log.Fatalf("❌ 第 %d 个分片上传失败: %v", i+1, err)
+		}
+
+		roots = append(roots, root)
+		fmt.Printf("✅ 上传成功！Root: %s\nTxHash: %s\n", root, txHash)
+	}
+
+	// --- 步骤 3: 下载验证 ---
+	fmt.Println("\n>>> 步骤 3: 开始下载验证...")
+	for i, root := range roots {
+		outFile := fmt.Sprintf("downloaded_chunk_%d.bin", i)
+		fmt.Printf("正在下载第 %d 个分片 (Root: %s)... \n", i+1, root[:10]+"...")
+
+		if err := uploader.Download(ctx, root, outFile); err != nil {
+			log.Printf("❌ 下载失败: %v", err)
+		} else {
+			fmt.Printf("✅ 下载成功: %s\n", outFile)
+			os.Remove(outFile) // 验证完就删掉
+		}
+	}
+
+	fmt.Println("\n========================================================")
+	fmt.Println("🚀 恭喜！全流程完成，可以提交作业了！")
+	fmt.Println("========================================================")
+}
+
+// --- 辅助函数 ---
+
+// 初始化上传客户端：使用 indexer + blockchain 封装一个简单的 StorageClient
+func setupClient(pkHex string) (*StorageClient, error) {
+	// 这里直接把私钥字符串交给 web3 客户端（可带 0x 前缀）
+	w3 := blockchain.MustNewWeb3(EvmRpcUrl, pkHex)
+
+	idxClient, err := indexer.NewClient(IndexerUrl, indexer.IndexerClientOption{
+		LogOption: zg_common.LogOption{
+			LogLevel: logrus.InfoLevel, // 避免 Reminder 使用 PanicLevel 导致 panic
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("indexer 客户端初始化失败: %w", err)
+	}
+
+	return &StorageClient{
+		idx: idxClient,
+		w3:  w3,
+	}, nil
+}
+
+// Upload 上传一块数据到 0g 存储，返回交易哈希和 root
+func (c *StorageClient) Upload(ctx context.Context, data []byte) (string, string, error) {
+	iter, err := core.NewDataInMemory(data)
+	if err != nil {
+		return "", "", fmt.Errorf("创建内存数据失败: %w", err)
+	}
+
+	// 通过 indexer 选择节点并上传
+	txHash, err := c.idx.Upload(ctx, c.w3, iter, transfer.UploadOption{
+		FinalityRequired: transfer.FileFinalized,
+		ExpectedReplica:  1,
+		TaskSize:         UploadTaskSize, // 【作业考点】设置单次上传任务包含的 segment 数量
+		Method:           "min",          // 使用官方推荐的 "min" 方式选择节点
+		FullTrusted:      true,           // 只用 trusted 节点，避免 discovered 干扰
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("上传失败: %w", err)
+	}
+
+	// 本地计算 merkle root，作为返回的 root
+	tree, err := core.MerkleTree(iter)
+	if err != nil {
+		return "", "", fmt.Errorf("计算 Merkle Root 失败: %w", err)
+	}
+
+	return txHash.Hex(), tree.Root().Hex(), nil
+}
+
+// Download 按 root 下载到指定文件
+func (c *StorageClient) Download(ctx context.Context, root, outFile string) error {
+	// indexer.Client 已封装好从合适的节点下载
+	return c.idx.Download(ctx, root, outFile, false)
+}
+
+// debugShardedNodes 打印当前 indexer 返回的节点和 shard 配置，辅助排查 “replication requirement” 类错误
+func debugShardedNodes(ctx context.Context) {
+	fmt.Println("\n>>> 调试：从 Indexer 拉取当前存储节点信息...")
+
+	idxClient, err := indexer.NewClient(IndexerUrl)
+	if err != nil {
+		fmt.Printf("获取 Indexer 客户端失败: %v\n", err)
+		return
+	}
+
+	nodes, err := idxClient.GetShardedNodes(ctx)
+	if err != nil {
+		fmt.Printf("调用 GetShardedNodes 失败: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Indexer 返回节点情况：Trusted=%d, Discovered=%d\n", len(nodes.Trusted), len(nodes.Discovered))
+
+	printNodes := func(title string, list []*shard.ShardedNode) {
+		fmt.Println(title)
+		for i, n := range list {
+			fmt.Printf("  #%d URL=%s, NumShard=%d, ShardId=%d, Latency=%dms\n",
+				i, n.URL, n.Config.NumShard, n.Config.ShardId, n.Latency)
+		}
+	}
+
+	printNodes("  Trusted 节点列表：", nodes.Trusted)
+	printNodes("  Discovered 节点列表：", nodes.Discovered)
+}
+
+// 快速生成稀疏大文件
+func createDummyFile(name string, size int64) error {
+	f, err := os.Create(name)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = f.Seek(size-1, 0)
-	if err != nil {
+	if _, err := f.Seek(size-1, 0); err != nil {
 		return err
 	}
 	_, err = f.Write([]byte{0})
 	return err
-}
-
-func runCommand(command string, args ...string) (string, error) {
-	// 打印一下具体执行了什么命令，方便调试
-	fmt.Printf("执行命令: %s %s\n", command, strings.Join(args, " "))
-
-	cmd := exec.Command(command, args...)
-	stdout, _ := cmd.StdoutPipe()
-	cmd.Stderr = cmd.Stdout
-
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-
-	var fullOutput strings.Builder
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		m := scanner.Text()
-		fmt.Println(m) // 实时打印日志
-		fullOutput.WriteString(m + "\n")
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return fullOutput.String(), err
-	}
-	return fullOutput.String(), nil
-}
-
-func parseRootHash(log string) string {
-	re := regexp.MustCompile(`root[:\s]+(0x[a-fA-F0-9]{64})`)
-	matches := re.FindStringSubmatch(log)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-	return ""
 }
